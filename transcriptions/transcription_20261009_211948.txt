@@ -1,0 +1,5 @@
+SPEECH-TO-TEXT TRANSCRIPTION
+============================
+Date and time: 2026-10-09 21:19:48
+
+RAG is artificial intelligence technique that combines information retrieval with text generation. It retrieves relevant information from external sources and gives that information to a large language model to help it answer a question. RAG stands for retrieval augmented generation R. Ah. Okay. Yeah.

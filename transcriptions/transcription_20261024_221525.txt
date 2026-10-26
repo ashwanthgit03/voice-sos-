@@ -1,0 +1,11 @@
+SPEECH-TO-TEXT TRANSCRIPTION
+============================
+Date and time: 2026-10-24 22:15:25
+
+how are you i'm fine so what can i do for you should i help you speak clearly at the microphone close help me i'm in danger please say o me i'm watching everything the boy the boy asked for i'm going to go home but i'm going to go home i want to see my husband come on what's the matter
+
+EMERGENCY DETECTION STATUS
+============================
+EMERGENCY DETECTED!
+Detected phrases: i m in danger, help me, help
+Transcribed text: how are you i'm fine so what can i do for you should i help you speak clearly at the microphone close help me i'm in danger please say o me i'm watching everything the boy the boy asked for i'm going to go home but i'm going to go home i want to see my husband come on what's the matter

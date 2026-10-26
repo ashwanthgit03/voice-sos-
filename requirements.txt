@@ -1,0 +1,16 @@
+torch
+torchaudio
+transformers
+datasets
+accelerate
+evaluate
+jiwer
+librosa
+soundfile
+sounddevice
+numpy
+pandas
+scipy
+tqdm
+sentencepiece
+noisereduce

@@ -1,0 +1,11 @@
+SPEECH-TO-TEXT TRANSCRIPTION
+============================
+Date and time: 2026-10-24 22:09:50
+
+tomorrow will be a horrid dayi don't know what to speak i just need to die help me danger please help me i'm in danger we're getting one super just came down and are you because it's just the silver he's just a salonist like dumb like an electric bill
+
+EMERGENCY DETECTION STATUS
+============================
+EMERGENCY DETECTED!
+Detected phrases: please help me, i m in danger, help me
+Transcribed text: tomorrow will be a horrid dayi don't know what to speak i just need to die help me danger please help me i'm in danger we're getting one super just came down and are you because it's just the silver he's just a salonist like dumb like an electric bill
