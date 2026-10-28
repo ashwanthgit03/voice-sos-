@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "669482709188",
+    "project_id": "voice-sos",
+    "storage_bucket": "voice-sos.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:669482709188:android:cda9a24a4d74ad592c1991",
+        "android_client_info": {
+          "package_name": "com.example.womensos"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAhIqTN7c0lcNqdOu5ZM5KChfl45DGZpjQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
