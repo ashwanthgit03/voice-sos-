@@ -1,31 +1,39 @@
 import re
 import string
 import evaluate
+import jiwer
+
 wer_metric = evaluate.load("wer")
+
+
 def normalize_text(text):
-    # Ignore uppercase vs lowercase
+    """Normalize text by converting to lowercase and stripping punctuation/extra spaces."""
+    if text is None:
+        return ""
     text = text.lower()
-    # Remove punctuation
-    text = text.translate(
-        str.maketrans("", "", string.punctuation)
-    )
-    # Normalize extra spaces
+    text = text.translate(str.maketrans("", "", string.punctuation))
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
 def calculate_wer(predictions, references):
-    predictions = [
-        normalize_text(text)
-        for text in predictions
-    ]
-    references = [
-        normalize_text(text)
-        for text in references
-    ]
+    """Calculate Word Error Rate (WER) after normalization."""
+    predictions = [normalize_text(text) for text in predictions]
+    references = [normalize_text(text) for text in references]
     score = wer_metric.compute(
         predictions=predictions,
         references=references
     )
-    return score
+    return float(score)
+
+
+def calculate_cer(predictions, references):
+    """Calculate Character Error Rate (CER) after normalization."""
+    predictions = [normalize_text(text) for text in predictions]
+    references = [normalize_text(text) for text in references]
+    return float(jiwer.cer(references, predictions))
+
+
 if __name__ == "__main__":
     predictions = [
         "Hello, World!",
@@ -35,8 +43,7 @@ if __name__ == "__main__":
         "hello world",
         "this is test"
     ]
-    score = calculate_wer(
-        predictions,
-        references
-    )
-    print(f"Normalized WER: {score:.4f}")
+    wer = calculate_wer(predictions, references)
+    cer = calculate_cer(predictions, references)
+    print(f"Normalized WER: {wer:.4f}")
+    print(f"Normalized CER: {cer:.4f}")

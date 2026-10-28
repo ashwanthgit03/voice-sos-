@@ -1,4 +1,11 @@
 import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 from transformers import (
     WhisperProcessor,
@@ -7,8 +14,11 @@ from transformers import (
     Seq2SeqTrainer,
 )
 from src.data.prepare_dataset import prepare_dataset
+
 MODEL_NAME = "openai/whisper-small"
 OUTPUT_DIR = "models/trained/whisper_asr"
+
+
 def main():
     print("Loading Whisper processor...")
     processor = WhisperProcessor.from_pretrained(
@@ -16,13 +26,21 @@ def main():
         language="English",
         task="transcribe"
     )
+
     print("Loading Whisper model...")
     model = WhisperForConditionalGeneration.from_pretrained(
         MODEL_NAME
     )
+
+    # Freeze encoder to preserve robust acoustic features and prevent catastrophic forgetting
+    print("Freezing Whisper encoder weights...")
+    model.freeze_encoder()
+
+    forced_prompt_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
     model.generation_config.language = "en"
     model.generation_config.task = "transcribe"
     model.generation_config.forced_decoder_ids = None
+
     print("Preparing dataset...")
     dataset = prepare_dataset(
         num_train=3000,
@@ -30,6 +48,7 @@ def main():
     )
     print("\nDataset ready:")
     print(dataset)
+
     def data_collator(features):
         input_features = [
             {"input_features": feature["input_features"]}
@@ -51,24 +70,31 @@ def main():
             labels_batch.attention_mask.ne(1),
             -100
         )
+        # Strip bos/prefix token if appended in previous tokenization step
         if (labels[:, 0] == processor.tokenizer.bos_token_id).all():
             labels = labels[:, 1:]
+        elif hasattr(processor.tokenizer, "prefix_tokens") and len(processor.tokenizer.prefix_tokens) > 0:
+            if (labels[:, 0] == processor.tokenizer.prefix_tokens[0]).all():
+                labels = labels[:, 1:]
+
         batch["labels"] = labels
         return batch
+
     use_fp16 = torch.cuda.is_available()
     print("\nCUDA available:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
+
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
         gradient_accumulation_steps=2,
-        learning_rate=1e-5,
+        learning_rate=3e-5,
         num_train_epochs=3,
         warmup_steps=100,
         fp16=use_fp16,
-        optim="adamw_torch_fused",
+        optim="adamw_torch_fused" if use_fp16 else "adamw_torch",
         gradient_checkpointing=True,
         dataloader_num_workers=0,
         logging_steps=10,
@@ -81,6 +107,7 @@ def main():
         report_to="none",
         remove_unused_columns=False,
     )
+
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
@@ -89,12 +116,17 @@ def main():
         data_collator=data_collator,
         processing_class=processor,
     )
-    print("\nStarting test training...")
+
+    print("\nStarting training...")
     trainer.train()
-    print("\nSaving model...")
+
+    print("\nSaving model with forced decoder configuration...")
+    model.generation_config.forced_decoder_ids = forced_prompt_ids
     trainer.save_model(OUTPUT_DIR)
     processor.save_pretrained(OUTPUT_DIR)
     print("\nTraining completed successfully.")
     print("Model saved to:", OUTPUT_DIR)
+
+
 if __name__ == "__main__":
     main()
