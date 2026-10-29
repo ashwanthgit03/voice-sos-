@@ -7,82 +7,129 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.ToneGenerator
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
-import kotlin.math.sqrt
 
+// ---------------------------------------------------------------------------
+// Shared result data class — used by MainActivity to drive UI
+// ---------------------------------------------------------------------------
+data class PredictionResult(
+    val prediction: String,
+    val confidence: Double,
+    val distressConfidence: Double,
+    val whisperText: String,
+    val keywordFound: Boolean,
+    val triggerEmergency: Boolean,
+    val timestamp: String,
+    val error: String = ""
+)
+
+// ---------------------------------------------------------------------------
+// AudioMonitoringService
+// Runs as a foreground service.
+// Records audio in 10-second windows, POSTs each window to the backend,
+// and triggers an alarm beep + notification if an emergency is confirmed.
+// ---------------------------------------------------------------------------
 class AudioMonitoringService : Service() {
 
     companion object {
-        const val ACTION_START =
-            "com.example.womensos.ACTION_START_MONITORING"
+        const val ACTION_START      = "com.example.womensos.ACTION_START_MONITORING"
+        const val ACTION_STOP       = "com.example.womensos.ACTION_STOP_MONITORING"
+        const val EXTRA_BACKEND_URL = "BACKEND_URL"
 
-        const val ACTION_STOP =
-            "com.example.womensos.ACTION_STOP_MONITORING"
+        const val CHANNEL_ID           = "womensos_audio_monitoring"
+        const val EMERGENCY_CHANNEL_ID = "womensos_emergency"
+        const val NOTIFICATION_ID      = 1001
+        const val EMERGENCY_NOTIF_ID   = 1002
 
-        const val CHANNEL_ID = "womensos_audio_monitoring"
-        const val NOTIFICATION_ID = 1001
+        private const val TAG            = "WomenSOSAudio"
+        private const val SAMPLE_RATE    = 16000        // Hz
+        private const val WINDOW_SECONDS = 10           // seconds per analysis window
 
-        private const val TAG = "WomenSOSAudio"
-        private const val SAMPLE_RATE = 16000
+        // Observed by MainActivity
+        val lastResult = MutableStateFlow<PredictionResult?>(null)
+        val isRunning  = MutableStateFlow(false)
     }
 
+    // ── Service state ──────────────────────────────────────────────────────
     private val isMonitoring = AtomicBoolean(false)
+    private var audioRecord  : AudioRecord? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var backendUrl   = "http://10.0.2.2:8000"   // default (emulator localhost)
 
-    @Volatile
-    private var audioRecord: AudioRecord? = null
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
 
-    private var audioThread: Thread? = null
+    // ── Lifecycle ──────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        createNotificationChannels()
     }
 
-    override fun onStartCommand(
-        intent: Intent?,
-        flags: Int,
-        startId: Int
-    ): Int {
-
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-
             ACTION_STOP -> {
                 stopMonitoring()
                 stopSelf()
                 return START_NOT_STICKY
             }
-
             ACTION_START -> {
+                backendUrl = intent.getStringExtra(EXTRA_BACKEND_URL) ?: backendUrl
                 if (!isMonitoring.get()) {
                     startForegroundSafely()
-                    startMonitoring()
+                    startMonitoringLoop()
                 }
             }
-
             else -> {
-                // Do not start microphone capture without an explicit
-                // ACTION_START request from the visible app.
                 stopSelf()
                 return START_NOT_STICKY
             }
         }
-
         return START_NOT_STICKY
     }
 
-    private fun startForegroundSafely() {
-        val notification = buildNotification()
+    override fun onDestroy() {
+        stopMonitoring()
+        super.onDestroy()
+    }
 
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    // ── Foreground notification ────────────────────────────────────────────
+
+    private fun startForegroundSafely() {
+        val notification = buildMonitoringNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
-                NOTIFICATION_ID,
-                notification,
+                NOTIFICATION_ID, notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             )
         } else {
@@ -90,25 +137,26 @@ class AudioMonitoringService : Service() {
         }
     }
 
-    private fun startMonitoring() {
+    // ── Recording + upload loop ────────────────────────────────────────────
 
-        if (checkSelfPermission(
-                android.Manifest.permission.RECORD_AUDIO
-            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+    private fun startMonitoringLoop() {
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
-            Log.e(TAG, "Microphone permission has not been granted.")
+            Log.e(TAG, "RECORD_AUDIO permission not granted.")
             stopSelf()
             return
         }
 
-        val minBufferSize = AudioRecord.getMinBufferSize(
+        val samplesPerWindow = SAMPLE_RATE * WINDOW_SECONDS
+        val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
 
-        if (minBufferSize <= 0) {
-            Log.e(TAG, "Unable to determine microphone buffer size.")
+        if (minBuf <= 0) {
+            Log.e(TAG, "Cannot determine AudioRecord buffer size.")
             stopSelf()
             return
         }
@@ -119,12 +167,8 @@ class AudioMonitoringService : Service() {
                 SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-                maxOf(minBufferSize * 2, SAMPLE_RATE)
+                maxOf(minBuf * 4, samplesPerWindow * 2)
             )
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Microphone permission error.", e)
-            stopSelf()
-            return
         } catch (e: Exception) {
             Log.e(TAG, "Could not create AudioRecord.", e)
             stopSelf()
@@ -133,155 +177,228 @@ class AudioMonitoringService : Service() {
 
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             recorder.release()
-            Log.e(TAG, "AudioRecord initialization failed.")
+            Log.e(TAG, "AudioRecord failed to initialise.")
             stopSelf()
             return
         }
 
         audioRecord = recorder
-
-        try {
-            recorder.startRecording()
-        } catch (e: Exception) {
-            Log.e(TAG, "Could not start microphone capture.", e)
-            recorder.release()
-            audioRecord = null
-            stopSelf()
-            return
-        }
-
         isMonitoring.set(true)
+        isRunning.value = true
+        Log.i(TAG, "Monitoring started — backend: $backendUrl")
 
-        audioThread = thread(
-            start = true,
-            name = "WomenSOSAudioThread"
-        ) {
-            captureAudio(recorder)
+        serviceScope.launch {
+            try {
+                recorder.startRecording()
+
+                val windowBuf = ShortArray(samplesPerWindow)
+                val readBuf   = ShortArray(2048)
+                var windowPos = 0
+
+                while (isMonitoring.get()) {
+                    val read = recorder.read(readBuf, 0, readBuf.size)
+                    if (read <= 0) continue
+
+                    // Fill the 10-second window buffer from the read block
+                    var src = 0
+                    while (src < read && isMonitoring.get()) {
+                        val toCopy = minOf(read - src, samplesPerWindow - windowPos)
+                        readBuf.copyInto(windowBuf, windowPos, src, src + toCopy)
+                        windowPos += toCopy
+                        src       += toCopy
+
+                        if (windowPos >= samplesPerWindow) {
+                            // Window full — convert to WAV and upload
+                            val wav = pcmToWav(windowBuf.copyOf(), SAMPLE_RATE)
+                            sendToBackend(wav)
+                            windowPos = 0
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Recording loop error.", e)
+            } finally {
+                try { recorder.stop() }   catch (_: Exception) {}
+                try { recorder.release() } catch (_: Exception) {}
+                audioRecord  = null
+                isRunning.value = false
+                Log.i(TAG, "Recording stopped.")
+            }
         }
-
-        Log.i(TAG, "Microphone monitoring started.")
     }
 
-    private fun captureAudio(recorder: AudioRecord) {
+    // ── HTTP upload ────────────────────────────────────────────────────────
 
-        val buffer = ShortArray(2048)
+    private suspend fun sendToBackend(wavBytes: ByteArray) {
+        val url = "${backendUrl.trimEnd('/')}/predict"
+        Log.i(TAG, "Uploading ${wavBytes.size / 1024} KB to $url")
 
-        while (isMonitoring.get()) {
-
-            val samplesRead = try {
-                recorder.read(
-                    buffer,
-                    0,
-                    buffer.size,
-                    AudioRecord.READ_BLOCKING
+        try {
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart(
+                    "audio", "live_window.wav",
+                    wavBytes.toRequestBody("audio/wav".toMediaType())
                 )
-            } catch (e: Exception) {
-                Log.e(TAG, "Microphone read failed.", e)
-                break
+                .build()
+
+            val request = Request.Builder().url(url).post(body).build()
+
+            val responseJson = withContext(Dispatchers.IO) {
+                http.newCall(request).execute().use { it.body?.string() ?: "" }
             }
 
-            if (samplesRead <= 0) {
-                if (isMonitoring.get()) {
-                    Log.w(TAG, "No audio samples received: $samplesRead")
-                }
-                continue
-            }
-
-            // Calculate RMS sound level for this audio block.
-            // This is only a basic sound-intensity measurement,
-            // NOT an AI abnormal-sound classifier.
-            var sumSquares = 0.0
-
-            for (i in 0 until samplesRead) {
-                val sample = buffer[i].toDouble()
-                sumSquares += sample * sample
-            }
-
-            val rms = sqrt(sumSquares / samplesRead)
-            val normalizedLevel = rms / Short.MAX_VALUE
-
-            Log.d(
-                TAG,
-                "Audio block received; normalized level=$normalizedLevel"
+            val json   = JSONObject(responseJson)
+            val result = PredictionResult(
+                prediction         = json.optString("prediction", "unknown"),
+                confidence         = json.optDouble("confidence", 0.0),
+                distressConfidence = json.optDouble("distress_confidence", 0.0),
+                whisperText        = json.optString("whisper_text", ""),
+                keywordFound       = json.optBoolean("keyword_found", false),
+                triggerEmergency   = json.optBoolean("trigger_emergency", false),
+                timestamp          = json.optString("timestamp", "")
             )
 
-            // AI MODEL INTEGRATION POINT:
-            // Send short audio windows to your trained sound classifier
-            // here, or extract features for a model running on-device.
-            //
-            // Do not treat a high sound level alone as proof of danger.
-            // Connect a trained classifier before triggering alerts.
-        }
+            lastResult.value = result
+            Log.i(TAG, "Result: ${result.prediction} conf=${result.distressConfidence} emergency=${result.triggerEmergency}")
 
-        Log.i(TAG, "Microphone capture loop ended.")
+            if (result.triggerEmergency) {
+                withContext(Dispatchers.Main) {
+                    playEmergencyBeep()
+                    showEmergencyNotification(result)
+                }
+            }
+
+        } catch (e: IOException) {
+            Log.w(TAG, "Network error: ${e.message}")
+            lastResult.value = PredictionResult(
+                prediction = "network_error", confidence = 0.0, distressConfidence = 0.0,
+                whisperText = "", keywordFound = false, triggerEmergency = false,
+                timestamp = "", error = "Cannot reach backend — check IP & server."
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Upload error: ${e.message}", e)
+        }
     }
+
+    // ── Emergency beep ────────────────────────────────────────────────────
+
+    private fun playEmergencyBeep() {
+        try {
+            val tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+            // Play a loud, repeating alert tone for 4 seconds
+            tone.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 4000)
+            Handler(Looper.getMainLooper()).postDelayed({ tone.release() }, 5000)
+            Log.i(TAG, "Emergency beep played.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Beep failed: ${e.message}")
+        }
+    }
+
+    // ── Emergency notification ─────────────────────────────────────────────
+
+    private fun showEmergencyNotification(result: PredictionResult) {
+        val nm  = getSystemService(NotificationManager::class.java)
+        val txt = when {
+            result.whisperText.isNotBlank() ->
+                "Keyword detected: \"${result.whisperText.take(60)}\""
+            else ->
+                "Distress confidence: ${(result.distressConfidence * 100).toInt()}%"
+        }
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, EMERGENCY_CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION") Notification.Builder(this)
+        }
+        nm.notify(
+            EMERGENCY_NOTIF_ID,
+            builder
+                .setContentTitle("🚨 KAVALAN — EMERGENCY ALERT")
+                .setContentText(txt)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setAutoCancel(false)
+                .setOngoing(true)
+                .setCategory(Notification.CATEGORY_ALARM)
+                .build()
+        )
+    }
+
+    // ── Stop monitoring ────────────────────────────────────────────────────
 
     private fun stopMonitoring() {
-
         isMonitoring.set(false)
-
-        try {
-            audioRecord?.stop()
-        } catch (e: Exception) {
-            Log.w(TAG, "Audio recorder was already stopped.", e)
-        }
-
-        try {
-            audioRecord?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not release audio recorder.", e)
-        }
-
+        isRunning.value = false
+        try { audioRecord?.stop() }    catch (_: Exception) {}
+        try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
-        audioThread = null
-
-        Log.i(TAG, "Microphone monitoring stopped.")
+        Log.i(TAG, "Monitoring stopped.")
     }
 
-    private fun createNotificationChannel() {
+    // ── Notification channels ─────────────────────────────────────────────
 
+    private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Women SOS Sound Monitoring",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description =
-                    "Shows when Women SOS microphone monitoring is active."
-                setShowBadge(false)
-            }
-
-            val manager =
-                getSystemService(NotificationManager::class.java)
-
-            manager.createNotificationChannel(channel)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "Kavalan — Sound Monitoring",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Active while Kavalan monitors background audio."
+                    setShowBadge(false)
+                }
+            )
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    EMERGENCY_CHANNEL_ID,
+                    "Kavalan — Emergency Alerts",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Fires when a confirmed distress signal is detected."
+                }
+            )
         }
     }
 
-    private fun buildNotification(): Notification {
-
-        val builder =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                Notification.Builder(this, CHANNEL_ID)
-            } else {
-                @Suppress("DEPRECATION")
-                Notification.Builder(this)
-            }
-
+    private fun buildMonitoringNotification(): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION") Notification.Builder(this)
+        }
         return builder
-            .setContentTitle("Women SOS")
-            .setContentText("Sound monitoring is active.")
+            .setContentTitle("Kavalan — Women SOS")
+            .setContentText("Listening for distress signals…")
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .build()
     }
 
-    override fun onDestroy() {
-        stopMonitoring()
-        super.onDestroy()
-    }
+    // ── PCM → WAV conversion ──────────────────────────────────────────────
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun pcmToWav(pcm: ShortArray, sampleRate: Int): ByteArray {
+        val dataSize  = pcm.size * 2           // 16-bit = 2 bytes per sample
+        val totalSize = dataSize + 44           // WAV header is 44 bytes
+        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
+        // RIFF chunk
+        buf.put("RIFF".toByteArray(Charsets.US_ASCII))
+        buf.putInt(totalSize - 8)
+        buf.put("WAVE".toByteArray(Charsets.US_ASCII))
+        // fmt sub-chunk
+        buf.put("fmt ".toByteArray(Charsets.US_ASCII))
+        buf.putInt(16)              // sub-chunk size
+        buf.putShort(1)             // PCM = 1
+        buf.putShort(1)             // mono
+        buf.putInt(sampleRate)
+        buf.putInt(sampleRate * 2)  // byte rate (16-bit mono)
+        buf.putShort(2)             // block align
+        buf.putShort(16)            // bits per sample
+        // data sub-chunk
+        buf.put("data".toByteArray(Charsets.US_ASCII))
+        buf.putInt(dataSize)
+        for (s in pcm) buf.putShort(s)
+        return buf.array()
+    }
 }

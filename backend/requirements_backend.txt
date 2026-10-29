@@ -1,0 +1,16 @@
+# Kavalan Voice SOS – Backend dependencies
+# Install with:  pip install -r backend/requirements_backend.txt
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Audio + ML
+librosa>=0.10.1
+soundfile>=0.12.1
+numpy>=1.24.0
+joblib>=1.3.0
+scikit-learn>=1.3.0
+
+# Whisper STT (installs openai-whisper, torch, etc.)
+openai-whisper>=20231117
