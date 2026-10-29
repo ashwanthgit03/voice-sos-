@@ -86,3 +86,33 @@ recordings/*.mp3
 
 .DS_Store
 Thumbs.db
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+
+# Machine learning models
+*.pkl
+*.joblib
+*.h5
+*.keras
+
+# Datasets
+*.csv
+
+# Environment secrets
+.env
+
+# Temporary files
+*.tmp
+.env
+.venv/
+__pycache__/
+*.pyc
+*.csv
+*.pkl
+*.wav
+*.mp3
+*.m4a
+audios/
